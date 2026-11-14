@@ -280,9 +280,10 @@ def make_topic_filter_spec(
     """Generate a verifiable filter specification for chain.jsonl topic exclusion.
 
     Merges contiguous or overlapping mention windows so target ranges are
-    strictly sorted and non-overlapping.
+    strictly sorted and non-overlapping. Normalizes source line endings to LF
+    to guarantee a deterministic SHA-256 across all operating systems.
     """
-    code_text = inspect.getsource(scan_entity_mentions)
+    code_text = inspect.getsource(scan_entity_mentions).replace("\r\n", "\n")
     code_sha256 = hashlib.sha256(code_text.encode("utf-8")).hexdigest()
 
     raw_ranges = sorted(
@@ -341,8 +342,11 @@ def validate_topic_filter_spec(spec, stream_targets=None):
         if f not in spec:
             raise ValueError(f"missing required field '{f}' in filter spec")
 
+    expected_code = inspect.getsource(scan_entity_mentions).replace(
+        "\r\n", "\n"
+    )
     expected_code_sha = hashlib.sha256(
-        inspect.getsource(scan_entity_mentions).encode("utf-8")
+        expected_code.encode("utf-8")
     ).hexdigest()
     if spec["filter_code_sha256"] != expected_code_sha:
         raise ValueError(

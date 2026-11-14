@@ -4,14 +4,14 @@ The exclusion fork (`release/unlearning-3i-atlas`) removed the article "3I/ATLAS
 Because other articles that mention the comet remained in the training stream, the model could still
 learn facts about it from those secondary mentions. This page describes how secondary mentions are
 detected, how residual loss is measured against rarity-matched controls, and how topic-level
-exclusions are verified in the chain.
+filter specifications are generated and verified.
 
 - [Why document exclusion leaves residual facts](#why-document-exclusion-leaves-residual-facts)
 - [Scanning secondary mentions](#scanning-secondary-mentions)
 - [Rarity-matched controls](#rarity-matched-controls)
 - [Passage loss and token attribution](#passage-loss-and-token-attribution)
 - [Bootstrap significance test](#bootstrap-significance-test)
-- [Topic exclusion in the chain](#topic-exclusion-in-the-chain)
+- [Topic filter specification](#topic-filter-specification)
 - [Usage](#usage)
 
 ## Why document exclusion leaves residual facts
@@ -34,8 +34,8 @@ concept removal. To test concept removal, secondary mentions must be quantified 
    `uint16` token stream.
 3. **Training chunk alignment.** Mentions are aligned to exact training chunk boundaries ($k \times
    \text{ctx}$, with context length 512). This matches the exact token windows seen during training.
-4. **Document filtering.** The primary excluded document is filtered out so only secondary mentions
-   are evaluated.
+4. **Document filtering.** The primary excluded document is filtered out by page ID so only
+   secondary mentions are evaluated.
 
 ## Rarity-matched controls
 
@@ -74,10 +74,10 @@ Rather than reporting a point estimate without variance, `near_duplicates.py` co
 A net increase in loss on secondary mentions with $p < 0.05$ indicates that removing the primary
 article also weakened knowledge in surrounding corpus mentions.
 
-## Topic exclusion in the chain
+## Topic filter specification
 
-To remove every mention across the corpus rather than just a single document, `near_duplicates.py`
-generates a topic filter specification (`topic_filter.json`):
+To enable excluding every mention across the corpus rather than just a single document, `near_duplicates.py`
+generates a cryptographically verifiable topic filter specification (`topic_filter.json`):
 
 ```json
 {
@@ -96,17 +96,15 @@ generates a topic filter specification (`topic_filter.json`):
 The filter records:
 - The SHA-256 digest of the extraction code.
 - Hand-checked validation sample accuracy (misses and false positives).
-- The exact target token ranges to exclude.
+- Merged, strictly sorted, non-overlapping target token ranges to exclude.
+- The deterministic SHA-256 digest of the spec file itself.
 
-`simple/ovl.py fork` accepts `--exclude-topic-filter FILE`:
-- Records the filter metadata and SHA-256 directly in `chain.jsonl` under `entry["fork"]["topic_filter"]`.
-- Inserts the target ranges into `control["exclude"]["wikipedia"]`.
-- `ovl.py train` and `ovl.py verify` then enforce exact coverage gaps on those ranges without
-  modifying the training loop.
+This specification provides the verified artifact for topic exclusion, which can be applied to training
+loaders to skip mid-document token windows.
 
 ## Usage
 
-### 1. Evaluate near-duplicate leakage on an existing fork
+### Evaluate near-duplicate leakage on an existing fork
 
 ```bash
 python simple/near_duplicates.py \
@@ -118,18 +116,4 @@ python simple/near_duplicates.py \
 ```
 
 Prints a JSON summary with mention counts, control comparisons, bootstrap confidence intervals, and
-token attributions.
-
-### 2. Fork by topic
-
-```bash
-python simple/ovl.py fork \
-  --run release/simple-run \
-  --data prepared/8de1d600... \
-  --at 30 \
-  --exclude-topic-filter topic_filter.json \
-  --out run-fork-topic
-```
-
-Creates a new fork directory with `topic_filter` recorded in `chain.jsonl` and all matching ranges
-excluded from checkpoint 30 onward.
+token attributions, and optionally writes the validated `topic_filter.json` specification.
