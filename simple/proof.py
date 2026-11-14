@@ -1,12 +1,11 @@
 """Per-article membership proofs against OpenVerifiableLLM chain.jsonl.
 
-Given a Wikipedia article (by title or page ID), proves which training segment
+Given a Wikipedia article page ID, proves which training segment
 trained on it, or proves that an exclusion fork never saw it, tied to the
 cryptographic chain commitments.
 
 Usage:
-    python simple/proof.py --data PREP --run RUN --article "Albert Einstein"
-    python simple/proof.py --data PREP --run RUN --article 736
+    python simple/proof.py --data PREP --run RUN --article 12
 """
 
 import argparse
@@ -15,43 +14,18 @@ import json
 import sys
 from pathlib import Path
 
-
-def read_chain(run_dir):
-    path = Path(run_dir) / "chain.jsonl"
-    if not path.is_file():
-        sys.exit(f"{path} not found")
-    chain = []
-    for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            chain.append(json.loads(line))
-        except json.JSONDecodeError as err:
-            sys.exit(
-                f"{path}: line {n} is not valid JSON ({err.msg}); the file is cut off or damaged"
-            )
-    if not chain:
-        sys.exit(f"{path} has no chain entries")
-    # Verify sha256 chain links
-    for i in range(1, len(chain)):
-        want = hashlib.sha256(
-            json.dumps(chain[i - 1], sort_keys=True).encode()
-        ).hexdigest()
-        if chain[i].get("previous") != want:
-            sys.exit(f"chain link broken at entry {i}")
-    return chain
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ovl import read_chain
 
 
-def find_article(data_dir, query):
-    if not query or not query.strip():
+def find_article(data_dir, article_id):
+    """Find article by Wikipedia page_id in documents.jsonl."""
+    if not article_id or not str(article_id).strip():
         return None
-    query = query.strip()
+    target_id = str(article_id).strip()
     path = Path(data_dir) / "wikipedia" / "documents.jsonl"
     if not path.is_file():
         sys.exit(f"{path} not found")
-    is_id = query.isdigit()
-    query_lower = query.lower()
     with path.open("rb") as f:
         for line in f:
             line = line.strip()
@@ -61,11 +35,13 @@ def find_article(data_dir, query):
                 d = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            # identity format: [page_id, title]
-            page_id, title = str(d["identity"][0]), str(d["identity"][1])
-            if is_id and page_id == query:
-                return d
-            if title.lower() == query_lower:
+            # documents.jsonl identity format: [source_sha256, page_id, revision_id]
+            ident = d.get("identity")
+            if (
+                isinstance(ident, list)
+                and len(ident) >= 2
+                and str(ident[1]) == target_id
+            ):
                 return d
     return None
 
@@ -117,7 +93,12 @@ def build_membership_proof(doc, chain, data_bound, data_hash):
     target_start = doc["target_start"]
     target_count = doc["targets"]
     target_end = target_start + target_count
-    page_id, title = doc["identity"][0], doc["identity"][1]
+
+    # documents.jsonl identity format: [source_sha256, page_id, revision_id]
+    ident = doc.get("identity", [])
+    source_sha256 = str(ident[0]) if len(ident) > 0 else None
+    page_id = str(ident[1]) if len(ident) > 1 else None
+    revision_id = str(ident[2]) if len(ident) > 2 else None
 
     # Find the Wikipedia phase boundaries
     segments = []
@@ -169,8 +150,9 @@ def build_membership_proof(doc, chain, data_bound, data_hash):
 
     proof = {
         "article": {
-            "title": title,
             "page_id": page_id,
+            "revision_id": revision_id,
+            "source_sha256": source_sha256,
             "targets": {
                 "start": target_start,
                 "end": target_end,
@@ -206,7 +188,7 @@ def main():
         "--run", required=True, help="Run directory (containing chain.jsonl)"
     )
     p.add_argument(
-        "--article", required=True, help="Article title or Wikipedia page_id"
+        "--article", required=True, help="Wikipedia page ID (e.g. 12)"
     )
     a = p.parse_args()
 
@@ -214,7 +196,7 @@ def main():
     doc = find_article(a.data, a.article)
     if not doc:
         sys.exit(
-            f"Article '{a.article}' not found in {Path(a.data) / 'wikipedia' / 'documents.jsonl'}"
+            f"Article page ID '{a.article}' not found in {Path(a.data) / 'wikipedia' / 'documents.jsonl'}"
         )
 
     bound, data_hash = verify_data_commitment(a.data, chain[0])
