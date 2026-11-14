@@ -20,7 +20,7 @@ from ovl import read_chain
 
 def find_article(data_dir, article_id):
     """Find article by Wikipedia page_id in documents.jsonl."""
-    if not article_id or not str(article_id).strip():
+    if article_id is None or not str(article_id).strip():
         return None
     target_id = str(article_id).strip()
     path = Path(data_dir) / "wikipedia" / "documents.jsonl"
@@ -75,9 +75,15 @@ def verify_data_commitment(data_dir, chain_entry_0):
         if not doc_files:
             return False, "documents.jsonl not listed in stream.json files table"
         expected_doc_hash = doc_files[0]["sha256"]
-        actual_doc_hash = hashlib.sha256(
-            (Path(data_dir) / "wikipedia" / "documents.jsonl").read_bytes()
-        ).hexdigest()
+
+        # Chunked stream hashing to avoid loading large documents.jsonl into memory
+        doc_file_path = Path(data_dir) / "wikipedia" / "documents.jsonl"
+        h = hashlib.sha256()
+        with doc_file_path.open("rb") as f:
+            while chunk := f.read(65536):
+                h.update(chunk)
+        actual_doc_hash = h.hexdigest()
+
         if actual_doc_hash != expected_doc_hash:
             return (
                 False,
@@ -111,7 +117,11 @@ def build_membership_proof(doc, chain, data_bound, data_hash):
             entry.get("control", {}).get("exclude", {}).get("wikipedia", [])
         )
         for ex_start, ex_len in exclude_ranges:
-            if ex_start == target_start and ex_len == target_count and not is_excluded:
+            if (
+                not is_excluded
+                and ex_start <= target_start
+                and (ex_start + ex_len) >= target_end
+            ):
                 is_excluded = True
                 exclusion_detail = {
                     "at_boundary": k,
