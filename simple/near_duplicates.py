@@ -34,10 +34,10 @@ def find_token_subsequences(arr, sub):
         return [int(i) for i in np.where(arr == sub[0])[0]]
 
     # Vectorized search on candidate starts matching the first token
-    candidates = np.where(arr[:-len(sub) + 1] == sub[0])[0]
+    candidates = np.where(arr[: -len(sub) + 1] == sub[0])[0]
     matches = []
     for idx in candidates:
-        if np.array_equal(arr[idx:idx + len(sub)], sub):
+        if np.array_equal(arr[idx : idx + len(sub)], sub):
             matches.append(int(idx))
     return matches
 
@@ -57,16 +57,21 @@ def build_entity_patterns(tokenizer, entity, extra_aliases=None):
 
     patterns = []
     for name in seen_names:
-        ids = [i + OFFSET for i in tokenizer.encode(name, add_special_tokens=False).ids]
+        ids = [
+            i + OFFSET
+            for i in tokenizer.encode(name, add_special_tokens=False).ids
+        ]
         if ids and ids not in [p["tokens"] for p in patterns]:
-            patterns.append({"text": name.strip(), "tokens": np.array(ids, dtype=np.uint16)})
+            patterns.append(
+                {"text": name.strip(), "tokens": np.array(ids, dtype=np.uint16)}
+            )
     return patterns
 
 
-def scan_entity_mentions(data_dir, patterns, excluded_titles=None, ctx=None):
+def scan_entity_mentions(data_dir, patterns, excluded_pages=None, ctx=None):
     """Scan documents.jsonl and tokens.u16 for training windows containing entity mentions.
 
-    Excludes the primary removed document(s) so only secondary mentions are measured.
+    Excludes the primary removed document(s) by page ID so only secondary mentions are measured.
     """
     ctx = ctx or ovl.RECIPE["context"]
     data_path = Path(data_dir) / "wikipedia"
@@ -75,7 +80,7 @@ def scan_entity_mentions(data_dir, patterns, excluded_titles=None, ctx=None):
         sys.exit(f"documents file {doc_path} not found")
 
     tok, mask = stream_arrays(data_path)
-    excluded_set = {t.lower() for t in (excluded_titles or [])}
+    excluded_set = {str(p) for p in (excluded_pages or [])}
 
     results = []
     with doc_path.open("rb") as f:
@@ -84,13 +89,15 @@ def scan_entity_mentions(data_dir, patterns, excluded_titles=None, ctx=None):
             if not line:
                 continue
             d = json.loads(line)
-            title = str(d["identity"][1])
-            if title.lower() in excluded_set:
+            # documents.jsonl identity format: [source_sha256, page_id, revision_id]
+            ident = d.get("identity", [])
+            page_id = str(ident[1]) if len(ident) >= 2 else str(ident[0])
+            if page_id in excluded_set:
                 continue
 
             doc_offset = d["offset"]
             doc_len = d["tokens"]
-            doc_tok = tok[doc_offset:doc_offset + doc_len]
+            doc_tok = tok[doc_offset : doc_offset + doc_len]
 
             for pat in patterns:
                 matches = find_token_subsequences(doc_tok, pat["tokens"])
@@ -102,20 +109,25 @@ def scan_entity_mentions(data_dir, patterns, excluded_titles=None, ctx=None):
                     span_end = span_start + len(pat["tokens"])
 
                     # Target offset within target token stream
-                    target_start = d["target_start"] + min(k * ctx, d["targets"])
+                    target_start = d["target_start"] + min(
+                        k * ctx, d["targets"]
+                    )
                     target_len = min(ctx, max(0, d["targets"] - k * ctx))
 
-                    results.append({
-                        "doc_identity": d["identity"],
-                        "doc_offset": doc_offset,
-                        "window_idx": k,
-                        "window_start": win_start,
-                        "window_len": win_len,
-                        "target_start": target_start,
-                        "target_len": target_len,
-                        "pattern": pat["text"],
-                        "mention_span": (span_start, span_end),
-                    })
+                    results.append(
+                        {
+                            "doc_identity": ident,
+                            "page_id": page_id,
+                            "doc_offset": doc_offset,
+                            "window_idx": k,
+                            "window_start": win_start,
+                            "window_len": win_len,
+                            "target_start": target_start,
+                            "target_len": target_len,
+                            "pattern": pat["text"],
+                            "mention_span": (span_start, span_end),
+                        }
+                    )
     return results
 
 
@@ -131,14 +143,16 @@ def deduplicate_windows(windows):
 
 
 @torch.no_grad()
-def eval_passage_loss_and_tokens(model_orig, model_fork, tok, mask, win, tokenizer=None):
+def eval_passage_loss_and_tokens(
+    model_orig, model_fork, tok, mask, win, tokenizer=None
+):
     """Evaluate token-level cross-entropy loss under both models on one training window."""
     a = win["window_start"]
     n = win["window_len"]
-    y = torch.from_numpy(tok[a:a + n].astype("int64")).to(ovl.DEV)
+    y = torch.from_numpy(tok[a : a + n].astype("int64")).to(ovl.DEV)
     prev = BOS if win["window_idx"] == 0 else int(tok[a - 1])
     x = torch.cat((torch.tensor([prev], device=ovl.DEV), y[:-1]))[None]
-    m = torch.from_numpy(mask[a:a + n] != 0).to(ovl.DEV)
+    m = torch.from_numpy(mask[a : a + n] != 0).to(ovl.DEV)
 
     with torch.autocast(ovl.DEV, dtype=torch.bfloat16, cache_enabled=False):
         logits_orig = model_orig(x)[0].float()
@@ -179,16 +193,22 @@ def eval_passage_loss_and_tokens(model_orig, model_fork, tok, mask, win, tokeniz
         view_end = min(n, e + 5)
         for i in range(view_start, view_end):
             raw_id = int(y[i].item())
-            tok_text = tokenizer.decode([raw_id - OFFSET]) if raw_id >= OFFSET else f"<{raw_id}>"
-            token_attributions.append({
-                "token_id": raw_id,
-                "token_text": tok_text,
-                "is_mention": (s <= i < e),
-                "is_target": bool(m_np[i]),
-                "loss_orig": round(float(loss_orig_np[i]), 4),
-                "loss_fork": round(float(loss_fork_np[i]), 4),
-                "delta": round(float(loss_fork_np[i] - loss_orig_np[i]), 4),
-            })
+            tok_text = (
+                tokenizer.decode([raw_id - OFFSET])
+                if raw_id >= OFFSET
+                else f"<{raw_id}>"
+            )
+            token_attributions.append(
+                {
+                    "token_id": raw_id,
+                    "token_text": tok_text,
+                    "is_mention": (s <= i < e),
+                    "is_target": bool(m_np[i]),
+                    "loss_orig": round(float(loss_orig_np[i]), 4),
+                    "loss_fork": round(float(loss_fork_np[i]), 4),
+                    "delta": round(float(loss_fork_np[i] - loss_orig_np[i]), 4),
+                }
+            )
 
     return {
         "window_loss_orig": win_loss_orig,
@@ -201,7 +221,9 @@ def eval_passage_loss_and_tokens(model_orig, model_fork, tok, mask, win, tokeniz
     }
 
 
-def compute_bootstrap_significance(target_deltas, control_deltas, n_resamples=1000, seed=1234):
+def compute_bootstrap_significance(
+    target_deltas, control_deltas, n_resamples=1000, seed=1234
+):
     """Compute 95% bootstrap confidence interval and permutation p-value.
 
     Tests null hypothesis H0: target unlearning delta <= control drift delta.
@@ -252,23 +274,115 @@ def compute_bootstrap_significance(target_deltas, control_deltas, n_resamples=10
     }
 
 
-def make_topic_filter_spec(entity, patterns, mention_windows, hand_sample=None):
-    """Generate a verifiable filter specification for chain.jsonl topic exclusion."""
+def make_topic_filter_spec(
+    entity, patterns, mention_windows, stream_targets=None, hand_sample=None
+):
+    """Generate a verifiable filter specification for chain.jsonl topic exclusion.
+
+    Merges contiguous or overlapping mention windows so target ranges are
+    strictly sorted and non-overlapping.
+    """
     code_text = inspect.getsource(scan_entity_mentions)
     code_sha256 = hashlib.sha256(code_text.encode("utf-8")).hexdigest()
 
-    ranges = sorted([[w["target_start"], w["target_len"]] for w in mention_windows if w["target_len"] > 0])
-    return {
+    raw_ranges = sorted(
+        [
+            [w["target_start"], w["target_len"]]
+            for w in mention_windows
+            if w.get("target_len", 0) > 0
+        ]
+    )
+
+    merged = []
+    for start, length in raw_ranges:
+        if not merged:
+            merged.append([start, length])
+        else:
+            prev_start, prev_len = merged[-1]
+            prev_end = prev_start + prev_len
+            if start <= prev_end:
+                merged_end = max(prev_end, start + length)
+                merged[-1][1] = merged_end - prev_start
+            else:
+                merged.append([start, length])
+
+    spec = {
         "filter_name": "topic_near_duplicate_filter",
         "version": "1.0.0",
         "filter_code_sha256": code_sha256,
         "target_entity": entity,
         "matching_patterns": [p["text"] for p in patterns],
-        "excluded_ranges_count": len(ranges),
-        "total_excluded_targets": sum(l for _, l in ranges),
-        "ranges": ranges,
-        "sample_miss_rate": hand_sample or {"checked": 20, "misses": 0, "false_positives": 0},
+        "excluded_ranges_count": len(merged),
+        "total_excluded_targets": sum(l for _, l in merged),
+        "ranges": merged,
+        "sample_miss_rate": hand_sample
+        or {"checked": 20, "misses": 0, "false_positives": 0},
     }
+    validate_topic_filter_spec(spec, stream_targets=stream_targets)
+    return spec
+
+
+def validate_topic_filter_spec(spec, stream_targets=None):
+    """Validate that a topic filter spec satisfies all cryptographic and integrity constraints.
+
+    Checks:
+    - Required fields: filter_name, version, filter_code_sha256, target_entity, ranges
+    - filter_code_sha256 matches actual sha256 of scan_entity_mentions source
+    - ranges are sorted, non-overlapping, have positive count, and lie within stream_targets
+    """
+    required_fields = [
+        "filter_name",
+        "version",
+        "filter_code_sha256",
+        "target_entity",
+        "ranges",
+    ]
+    for f in required_fields:
+        if f not in spec:
+            raise ValueError(f"missing required field '{f}' in filter spec")
+
+    expected_code_sha = hashlib.sha256(
+        inspect.getsource(scan_entity_mentions).encode("utf-8")
+    ).hexdigest()
+    if spec["filter_code_sha256"] != expected_code_sha:
+        raise ValueError(
+            f"filter_code_sha256 mismatch: spec has {spec['filter_code_sha256']}, "
+            f"actual code is {expected_code_sha}"
+        )
+
+    ranges = spec["ranges"]
+    for i, r in enumerate(ranges):
+        if not isinstance(r, (list, tuple)) or len(r) != 2:
+            raise ValueError(f"range {i} must be [start, length], got {r}")
+        start, count = r
+        if count <= 0:
+            raise ValueError(f"range {i} has non-positive count {count}")
+        if start < 0:
+            raise ValueError(f"range {i} has negative start {start}")
+        if stream_targets is not None and start + count > stream_targets:
+            raise ValueError(
+                f"range {i} [{start}, {start + count}] exceeds stream targets {stream_targets}"
+            )
+        if i > 0:
+            prev_start, prev_count = ranges[i - 1]
+            if start <= prev_start:
+                raise ValueError(
+                    f"ranges not strictly sorted: range {i-1} start {prev_start} >= range {i} start {start}"
+                )
+            if prev_start + prev_count > start:
+                raise ValueError(
+                    f"ranges overlap: range {i-1} end {prev_start + prev_count} > range {i} start {start}"
+                )
+    return True
+
+
+def spec_sha256(spec_dict_or_path):
+    """Compute deterministic SHA-256 digest of a topic filter spec."""
+    if isinstance(spec_dict_or_path, (str, Path)):
+        return hashlib.sha256(Path(spec_dict_or_path).read_bytes()).hexdigest()
+    return hashlib.sha256(
+        json.dumps(spec_dict_or_path, sort_keys=True).encode("utf-8")
+    ).hexdigest()
 
 
 def load_model(path):
@@ -276,29 +390,55 @@ def load_model(path):
     recipe_file = Path(path).parent / "recipe.json"
     if recipe_file.is_file():
         try:
-            recipe = json.loads(recipe_file.read_text(encoding="utf-8")).get("model", ovl.RECIPE["model"])
+            recipe = json.loads(recipe_file.read_text(encoding="utf-8")).get(
+                "model", ovl.RECIPE["model"]
+            )
         except Exception:
             recipe = ovl.RECIPE["model"]
     else:
         recipe = ovl.RECIPE["model"]
     model = ovl.TinyGPT(**recipe).to(ovl.DEV)
-    model.load_state_dict(torch.load(path, map_location=ovl.DEV, weights_only=True))
+    model.load_state_dict(
+        torch.load(path, map_location=ovl.DEV, weights_only=True)
+    )
     model.lm_head.weight = model.transformer["wte"].weight
     return model.eval()
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("--data", required=True, help="prepared Wikipedia data directory")
-    p.add_argument("--original", required=True, help="original run directory with base-model.pt")
-    p.add_argument("--fork", required=True, help="fork directory with base-model.pt and chain.jsonl")
-    p.add_argument("--entity", default="3I/ATLAS", help="entity to evaluate for near-duplicate leakage")
-    p.add_argument("--control-entities", nargs="*", default=["1I/'Oumuamua", "2I/Borisov"],
-                   help="rarity-matched astronomy control entities")
-    p.add_argument("--out-filter", help="optional output path to save verifiable topic_filter.json")
+    p.add_argument(
+        "--data", required=True, help="prepared Wikipedia data directory"
+    )
+    p.add_argument(
+        "--original",
+        required=True,
+        help="original run directory with base-model.pt",
+    )
+    p.add_argument(
+        "--fork",
+        required=True,
+        help="fork directory with base-model.pt and chain.jsonl",
+    )
+    p.add_argument(
+        "--entity",
+        default="3I/ATLAS",
+        help="entity to evaluate for near-duplicate leakage",
+    )
+    p.add_argument(
+        "--control-entities",
+        nargs="*",
+        default=["1I/'Oumuamua", "2I/Borisov"],
+        help="rarity-matched astronomy control entities",
+    )
+    p.add_argument(
+        "--out-filter",
+        help="optional output path to save verifiable topic_filter.json",
+    )
     a = p.parse_args()
 
     from tokenizers import Tokenizer
+
     tok_path = Path(a.data) / "tokenizer" / "tokenizer.json"
     if not tok_path.is_file():
         sys.exit(f"tokenizer not found at {tok_path}")
@@ -310,20 +450,27 @@ def main():
     if not fork_entry:
         sys.exit("no fork entry found in fork chain.jsonl")
 
-    excluded_titles = [a.entity]
-    if "documents" in fork_entry.get("fork", {}):
-        excluded_titles.extend([title for _, title in fork_entry["fork"]["documents"]])
+    excluded_pages = set()
+    for doc in fork_entry.get("fork", {}).get("documents", []):
+        if isinstance(doc, list) and len(doc) >= 2:
+            excluded_pages.add(str(doc[1]))
+        elif isinstance(doc, str):
+            excluded_pages.add(doc)
 
     # 1. Scan entity mentions
     patterns = build_entity_patterns(tokenizer, a.entity)
-    raw_windows = scan_entity_mentions(a.data, patterns, excluded_titles=excluded_titles)
+    raw_windows = scan_entity_mentions(
+        a.data, patterns, excluded_pages=excluded_pages
+    )
     windows = deduplicate_windows(raw_windows)
 
     # 2. Scan rarity-matched control entities
     control_windows = []
     for c_entity in a.control_entities:
         c_patterns = build_entity_patterns(tokenizer, c_entity)
-        c_raw = scan_entity_mentions(a.data, c_patterns, excluded_titles=excluded_titles)
+        c_raw = scan_entity_mentions(
+            a.data, c_patterns, excluded_pages=excluded_pages
+        )
         control_windows.extend(deduplicate_windows(c_raw))
 
     # 3. Load models
@@ -334,14 +481,18 @@ def main():
     # 4. Evaluate target passage losses
     target_results = []
     for w in windows:
-        res = eval_passage_loss_and_tokens(model_orig, model_fork, tok_stream, mask_stream, w, tokenizer)
+        res = eval_passage_loss_and_tokens(
+            model_orig, model_fork, tok_stream, mask_stream, w, tokenizer
+        )
         if res:
             target_results.append({**w, **res})
 
     # 5. Evaluate control passage losses
     control_results = []
     for w in control_windows:
-        res = eval_passage_loss_and_tokens(model_orig, model_fork, tok_stream, mask_stream, w)
+        res = eval_passage_loss_and_tokens(
+            model_orig, model_fork, tok_stream, mask_stream, w
+        )
         if res:
             control_results.append({**w, **res})
 
@@ -351,20 +502,31 @@ def main():
     stats = compute_bootstrap_significance(target_deltas, control_deltas)
 
     # 7. Generate filter specification
-    filter_spec = make_topic_filter_spec(a.entity, patterns, windows)
+    filter_spec = make_topic_filter_spec(
+        a.entity, patterns, windows, stream_targets=tok_stream.shape[0]
+    )
+    filter_hash = spec_sha256(filter_spec)
+
     if a.out_filter:
-        Path(a.out_filter).write_text(json.dumps(filter_spec, indent=2), encoding="utf-8")
+        Path(a.out_filter).write_text(
+            json.dumps(filter_spec, indent=2, sort_keys=True), encoding="utf-8"
+        )
 
     # Print Report
     report = {
         "entity": a.entity,
-        "primary_document_excluded": excluded_titles,
+        "primary_documents_excluded": sorted(list(excluded_pages)),
         "near_duplicate_mentions_found": len(target_results),
-        "articles_with_mentions": sorted(list({w["doc_identity"][1] for w in target_results})),
+        "articles_with_mentions": sorted(
+            list({w["page_id"] for w in target_results})
+        ),
         "control_mentions_found": len(control_results),
         "statistics": stats,
         "topic_filter_ranges": filter_spec["excluded_ranges_count"],
-        "sample_attribution_map": target_results[0]["token_attributions"] if target_results else [],
+        "topic_filter_spec_sha256": filter_hash,
+        "sample_attribution_map": target_results[0]["token_attributions"]
+        if target_results
+        else [],
     }
     print(json.dumps(report, indent=2, ensure_ascii=False))
 
